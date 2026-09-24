@@ -1,8 +1,10 @@
 'use client'
 
-import { Keypair } from '@stellar/stellar-sdk'
+import { TransactionBuilder, hash } from '@stellar/stellar-sdk'
+import { ensureFeePayer } from '@/lib/feePayer'
 import { getNetwork } from '@/lib/network'
 import { walletLocal, walletSession } from '@/lib/walletStorage'
+import { getSppConfig } from './config'
 
 export type PrivacyStatus = 'idle' | 'syncing' | 'ready' | 'error'
 
@@ -23,9 +25,6 @@ export interface PrivacyClient {
   stop: () => void
 }
 
-const DEFAULT_BOOTNODE_URL = 'https://bootnode.dev-nethermind.xyz'
-const DEFAULT_POOL = process.env.NEXT_PUBLIC_SPP_XLM_POOL?.trim() || ''
-
 function toBigInt(value: bigint | number | string): bigint {
   if (typeof value === 'bigint') return value
   if (typeof value === 'number') return BigInt(Math.trunc(value))
@@ -36,55 +35,57 @@ function getWalletAddress(): string {
   return walletSession.getItem('invisible_wallet_address') || walletLocal.getItem('invisible_wallet_address') || ''
 }
 
-function getFeePayerSecret(): string | null {
-  return walletSession.getItem('veil_signer_secret') || walletLocal.getItem('veil_signer_secret') || null
-}
-
-function getSigner(): { getPublicKey: () => Promise<string>; signMessage: (message: string | Uint8Array) => Promise<Uint8Array>; signTransaction: (xdr: string) => Promise<string>; signAuthEntry: (entry: string) => Promise<string> } {
-  const secret = getFeePayerSecret()
-  if (!secret) {
+async function getSigner() {
+  const keypair = await ensureFeePayer()
+  if (!keypair) {
     throw new Error('No spending account is available for privacy operations. Fund your fee-payer first.')
   }
-
-  const keypair = Keypair.fromSecret(secret)
 
   return {
     async getPublicKey() {
       return keypair.publicKey()
     },
-    async signMessage(message) {
+    async signMessage(message: string | Uint8Array) {
       const bytes = typeof message === 'string' ? new TextEncoder().encode(message) : message
-      const signed = keypair.sign(bytes as any) as Uint8Array
-      return new Uint8Array(signed.slice())
+      return keypair.sign(Buffer.from(bytes)).toString('base64')
     },
-    async signTransaction(xdr) {
-      return xdr
+    async signTransaction(xdr: string, options?: { networkPassphrase?: string }) {
+      const transaction = TransactionBuilder.fromXDR(
+        xdr,
+        options?.networkPassphrase ?? getNetwork().networkPassphrase,
+      )
+      transaction.sign(keypair)
+      return { signedTxXdr: transaction.toXDR(), signerAddress: keypair.publicKey() }
     },
-    async signAuthEntry(entry) {
-      return entry
+    async signAuthEntry(entry: string) {
+      const signature = keypair.sign(hash(Buffer.from(entry, 'base64')))
+      return { signedAuthEntry: signature.toString('base64'), signerAddress: keypair.publicKey() }
     },
   }
 }
 
-function getContractConfig(): any {
+function getContractConfig(config: NonNullable<ReturnType<typeof getSppConfig>>) {
   const network = getNetwork()
   return {
     network: network.networkPassphrase,
-    deployer: 'veileff',
-    admin: 'veil-admin',
-    asp_membership: 'veillocal',
-    asp_non_membership: 'veillocal',
-    verifiers: {},
-    public_key_registry: 'C0000000000000000000000000000000000000000000000000000000000000000',
-    pools: DEFAULT_POOL
-      ? [{
-          poolContractId: DEFAULT_POOL,
-          tokenContractId: 'CCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-          deploymentLedger: 0,
-          enabled: true,
-          asset: { kind: 'native' as const, code: 'XLM', symbol: 'XLM' },
-        }]
-      : [],
+    deployer: config.deployer,
+    admin: config.admin,
+    asp_membership: config.aspMembership,
+    asp_non_membership: config.aspNonMembership,
+    verifiers: { B: config.verifiers.standard, B_gvk_T: config.verifiers.traceable },
+    public_key_registry: config.publicKeyRegistry,
+    pools: config.pools.map((pool) => {
+      const assetKind: 'native' | 'contract' = pool.assetKind === 'native' ? 'native' : 'contract'
+      return {
+        poolContractId: pool.id,
+        tokenContractId: pool.tokenContractId,
+        deploymentLedger: pool.deploymentLedger,
+        enabled: true,
+        policyFlags: [...pool.policyFlags],
+        ...(pool.gvkMode ? { gvkMode: pool.gvkMode } : {}),
+        asset: { kind: assetKind, code: 'XLM', symbol: 'XLM' },
+      }
+    }),
   }
 }
 
@@ -95,7 +96,8 @@ async function initClient(): Promise<PrivacyClient> {
     throw new Error('Privacy is only available in the browser.')
   }
 
-  if (!DEFAULT_POOL) {
+  const sppConfig = getSppConfig()
+  if (!sppConfig) {
     throw new Error('SPP pool is not configured for this network yet.')
   }
 
@@ -105,15 +107,15 @@ async function initClient(): Promise<PrivacyClient> {
   const client = await module.Client.new({
     rpcUrl: network.rpcUrl,
     storage,
-    contractConfig: getContractConfig(),
-    circuitsBaseUrl: new URL('../../node_modules/stellar-private-payments/dist/circuits/', import.meta.url).href,
-    bootnodeUrl: DEFAULT_BOOTNODE_URL,
+    contractConfig: getContractConfig(sppConfig),
+    circuitsBaseUrl: `${window.location.origin}/spp/circuits/`,
+    bootnodeUrl: sppConfig.bootnodeUrl,
   })
 
-  const signer = getSigner()
+  const signer = await getSigner()
   const account = await client.account({ networkPassphrase: network.networkPassphrase, userAddress: getWalletAddress() }, signer as any)
 
-  const pool = await account.pool({ poolContract: DEFAULT_POOL })
+  const pool = await account.pool({ poolContract: sppConfig.pools[0].id })
 
   return {
     async sync() {

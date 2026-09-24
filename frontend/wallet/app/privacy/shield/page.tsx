@@ -1,15 +1,25 @@
 'use client'
 
 import { useEffect, useMemo, useState } from 'react'
-import { useRouter } from 'next/navigation'
+import { redirect, useRouter } from 'next/navigation'
 import { ChevronLeft } from 'lucide-react'
 import { attachPrivacyProgress, getPrivacyClient, toUserFacingPrivacyError } from '@/lib/privacy/client'
-
-const MAX_AMOUNT = '10'
+import { isPrivacyEnabled } from '@/lib/privacy/config'
 
 type Step = 'amount' | 'review' | 'proving' | 'complete' | 'error'
 
+function xlmToStroops(value: string): bigint {
+  const normalized = value.trim()
+  if (!/^\d+(\.\d{1,7})?$/.test(normalized)) {
+    throw new Error('Enter an amount with up to 7 decimal places.')
+  }
+  const [whole, fraction = ''] = normalized.split('.')
+  return BigInt(whole) * 10_000_000n + BigInt(fraction.padEnd(7, '0'))
+}
+
 export default function ShieldPage() {
+  if (!isPrivacyEnabled()) redirect('/dashboard')
+
   const router = useRouter()
   const [step, setStep] = useState<Step>('amount')
   const [amount, setAmount] = useState('1')
@@ -19,29 +29,26 @@ export default function ShieldPage() {
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
-    if (step !== 'proving') return
-
     const cleanup = attachPrivacyProgress((event) => {
       setProofState(event.message || 'Preparing proof…')
     })
 
     return cleanup
-  }, [step])
+  }, [])
 
   const invalidAmount = useMemo(() => {
     const value = Number(amount)
-    return !Number.isFinite(value) || value <= 0 || value > Number(MAX_AMOUNT)
+    return !Number.isFinite(value) || value <= 0 || !/^\d+(\.\d{1,7})?$/.test(amount.trim())
   }, [amount])
 
   const handleShield = async () => {
     setError(null)
     setLoading(true)
-    setStep('review')
 
     try {
       setStep('proving')
       const client = await getPrivacyClient()
-      const result = await client.shield(amount)
+      const result = await client.shield(xlmToStroops(amount))
       setTxHash(result)
       setStep('complete')
     } catch (caught) {
@@ -131,7 +138,7 @@ export default function ShieldPage() {
             <div style={{ padding: '1rem', borderRadius: 12, border: '1px solid var(--border-dim)', background: 'rgba(255,255,255,0.02)' }}>
               <p style={{ fontWeight: 600, color: 'var(--off-white)', marginBottom: '0.5rem' }}>What stays public</p>
               <p style={{ color: 'rgba(246,247,248,0.72)', lineHeight: 1.6 }}>
-                The deposit itself is visible on chain. The public tx proves the move into the pool, but the amount and recipient inside the pool remain private.
+                The deposit itself is visible on chain. The public transaction proves the move into the pool; later pool activity is private.
               </p>
             </div>
 
